@@ -184,6 +184,23 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			h.Upstream = args[0]
 
+		case "cdn_tunnel":
+			args := d.RemainingArgs()
+			if len(args) > 1 {
+				return d.ArgErr()
+			}
+			if h.CDNTunnelPath != "" {
+				return d.Err("cdn_tunnel subdirective specified twice")
+			}
+			if len(args) == 1 {
+				h.CDNTunnelPath = args[0]
+			} else {
+				h.CDNTunnelPath = "/tunnel"
+			}
+			if !strings.HasPrefix(h.CDNTunnelPath, "/") {
+				h.CDNTunnelPath = "/" + h.CDNTunnelPath
+			}
+
 		case "acl":
 			for nesting := d.Nesting(); d.NextBlock(nesting); {
 				aclDirective := d.Val()

@@ -107,6 +107,11 @@ type Handler struct {
 
 	// TODO: temporary/deprecated - we should try to reuse existing authentication modules instead!
 	AuthCredentials [][]byte `json:"auth_credentials,omitempty"` // slice with base64-encoded credentials
+
+	// Path for CDN-compatible POST tunnel endpoint. Empty string disables the feature.
+	// When set, POST requests to this path are treated as bidirectional tunnels,
+	// enabling NaiveProxy to work behind CDNs that block HTTP CONNECT.
+	CDNTunnelPath string `json:"cdn_tunnel_path,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -264,7 +269,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		if h.shouldServePACFile(r) {
 			return h.servePacFile(w, r)
 		}
-		return next.ServeHTTP(w, r)
+		// Let authenticated CDN tunnel requests fall through to the handler below.
+		if !h.isCDNTunnelRequest(r) {
+			return next.ServeHTTP(w, r)
+		}
 	}
 	if authErr != nil {
 		if h.ProbeResistance != nil {
@@ -353,6 +361,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 
 		panic("There was a check for http version, yet it's incorrect")
+	}
+
+	if h.isCDNTunnelRequest(r) {
+		return h.serveCDNTunnel(w, r, ctx)
 	}
 
 	// Scheme has to be appended to avoid `unsupported protocol scheme ""` error.
@@ -444,6 +456,55 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	return forwardResponse(w, response)
+}
+
+func (h *Handler) isCDNTunnelRequest(r *http.Request) bool {
+	return h.CDNTunnelPath != "" && r.Method == http.MethodPost && r.URL.Path == h.CDNTunnelPath
+}
+
+// serveCDNTunnel handles POST /tunnel requests from the naivecdn client.
+// The CDN forwards these POST requests to us, giving us bidirectional streaming
+// via the POST body (client→server) and response body (server→client).
+// The same NaiveProxy padding protocol is applied, reusing dualStream unchanged.
+func (h *Handler) serveCDNTunnel(w http.ResponseWriter, r *http.Request, ctx context.Context) error {
+	hostPort := r.Header.Get("X-Naive-Target")
+	if hostPort == "" {
+		return caddyhttp.Error(http.StatusBadRequest, errors.New("missing X-Naive-Target header"))
+	}
+
+	// Build padding response header (same range as CONNECT response: [30, 62))
+	paddingLen := rand.Intn(32) + 30
+	padding := make([]byte, paddingLen)
+	bits := rand.Uint64()
+	for i := 0; i < 16; i++ {
+		padding[i] = "!#$()+<>?@[]^`{}"[bits&15]
+		bits >>= 4
+	}
+	for i := 16; i < paddingLen; i++ {
+		padding[i] = '~'
+	}
+
+	w.Header().Set("Padding", string(padding))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		return caddyhttp.Error(http.StatusInternalServerError,
+			fmt.Errorf("flush error: %v", err))
+	}
+
+	targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
+	if err != nil {
+		return err
+	}
+	if targetConn == nil {
+		return caddyhttp.Error(http.StatusForbidden,
+			fmt.Errorf("hostname %s is not allowed", hostPort))
+	}
+	defer targetConn.Close()
+
+	hasPadding := r.Header.Get("Padding") != ""
+	defer r.Body.Close()
+	return dualStream(targetConn, r.Body, w, hasPadding)
 }
 
 func (h Handler) checkCredentials(r *http.Request) error {
