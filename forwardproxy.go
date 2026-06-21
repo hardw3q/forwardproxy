@@ -458,133 +458,112 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return forwardResponse(w, response)
 }
 
-// cdnSession is created by GET /tunnel and receives upstream data from POST /tunnel.
-type cdnSession struct {
-	pw   *io.PipeWriter
-	done chan struct{}
+// cdnMeekSession holds a persistent target connection for the Meek-style tunnel.
+// Each POST /tunnel carries upstream data and receives available downstream data
+// in the response body — no long-lived streaming connections required, so CDNs
+// that buffer streaming responses work transparently.
+type cdnMeekSession struct {
+	conn net.Conn
+	mu   sync.Mutex
 }
 
-// cdnSessions maps session ID → *cdnSession for the split-tunnel protocol.
-var cdnSessions sync.Map
+var cdnMeekSessions sync.Map
 
 func (h *Handler) isCDNTunnelRequest(r *http.Request) bool {
 	return h.CDNTunnelPath != "" && r.URL.Path == h.CDNTunnelPath &&
-		(r.Method == http.MethodGet || r.Method == http.MethodPost)
+		r.Method == http.MethodPost
 }
 
 func (h *Handler) serveCDNTunnel(w http.ResponseWriter, r *http.Request, ctx context.Context) error {
-	if r.Method == http.MethodGet {
-		return h.serveCDNDown(w, r, ctx)
-	}
-	return h.serveCDNUp(w, r)
+	return h.serveCDNMeek(w, r, ctx)
 }
 
-// serveCDNDown handles GET /tunnel — the downstream half of the split tunnel.
-// It returns 200 OK immediately (before dialing the target) so CDNs that buffer
-// before forwarding response headers don't add a full dial-latency to the
-// client's TLS handshake window. The target is dialed asynchronously; the pipe
-// between POST /tunnel handlers and the target absorbs data written before
-// the dial completes.
-func (h *Handler) serveCDNDown(w http.ResponseWriter, r *http.Request, ctx context.Context) error {
-	sessionID := r.Header.Get("X-Naive-Session")
-	hostPort := r.Header.Get("X-Naive-Target")
-	if sessionID == "" || hostPort == "" {
-		return caddyhttp.Error(http.StatusBadRequest,
-			errors.New("missing X-Naive-Session or X-Naive-Target"))
-	}
+// serveCDNMeek implements a Meek-style tunnel over POST requests.
+//
+// Protocol:
+//   - First POST includes X-Naive-Target: server dials target and creates session.
+//   - All POSTs carry upstream body → written to target.
+//   - Response body carries any downstream data available within meekReadTimeout.
+//   - 204 No Content means no downstream data was available this poll.
+//   - 410 Gone means the target connection was closed.
+func (h *Handler) serveCDNMeek(w http.ResponseWriter, r *http.Request, ctx context.Context) error {
+	const meekReadTimeout = 500 * time.Millisecond
+	const meekSessionTimeout = 2 * time.Minute
 
-	pr, pw := io.Pipe()
-	sess := &cdnSession{pw: pw, done: make(chan struct{})}
-	cdnSessions.Store(sessionID, sess)
-	defer func() {
-		cdnSessions.Delete(sessionID)
-		close(sess.done)
-		pw.Close()
-		pr.Close()
-	}()
-
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
-	w.Header().Set("X-Accel-Buffering", "no") // hint to nginx-based CDNs to disable buffering
-	w.Header().Set("Surrogate-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
-	rc := http.NewResponseController(w)
-	if err := rc.Flush(); err != nil {
-		return err
-	}
-
-	// Dial the target asynchronously and pipe data in both directions.
-	// POST /tunnel handlers write upstream chunks to pw; the goroutine below
-	// forwards them to the target once the dial succeeds.
-	targetCh := make(chan net.Conn, 1)
-	go func() {
-		targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
-		if err != nil || targetConn == nil {
-			pr.CloseWithError(fmt.Errorf("dial %s failed: %v", hostPort, err))
-			targetCh <- nil
-			return
-		}
-		targetCh <- targetConn
-		io.Copy(targetConn, pr) //nolint:errcheck
-		targetConn.Close()
-	}()
-
-	targetConn := <-targetCh
-	if targetConn == nil {
-		return nil
-	}
-	defer targetConn.Close()
-
-	// Stream target → client response body.
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := targetConn.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return nil
-			}
-			_ = rc.Flush()
-		}
-		if err != nil {
-			return nil
-		}
-	}
-}
-
-// serveCDNUp handles POST /tunnel — the upstream half of the split tunnel.
-// Each POST carries a small complete chunk of client→target data. The CDN
-// buffers small request bodies quickly, so latency per chunk is ~1 CDN RTT.
-func (h *Handler) serveCDNUp(w http.ResponseWriter, r *http.Request) error {
 	sessionID := r.Header.Get("X-Naive-Session")
 	if sessionID == "" {
 		return caddyhttp.Error(http.StatusBadRequest, errors.New("missing X-Naive-Session"))
 	}
 
-	val, ok := cdnSessions.Load(sessionID)
-	if !ok {
-		return caddyhttp.Error(http.StatusNotFound,
-			fmt.Errorf("session %s not found", sessionID))
+	var sess *cdnMeekSession
+	if v, ok := cdnMeekSessions.Load(sessionID); ok {
+		sess = v.(*cdnMeekSession)
+	} else {
+		hostPort := r.Header.Get("X-Naive-Target")
+		if hostPort == "" {
+			return caddyhttp.Error(http.StatusBadRequest, errors.New("new session requires X-Naive-Target"))
+		}
+		targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
+		if err != nil || targetConn == nil {
+			return caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("dial %s: %w", hostPort, err))
+		}
+		sess = &cdnMeekSession{conn: targetConn}
+		cdnMeekSessions.Store(sessionID, sess)
+		// Evict idle sessions automatically.
+		time.AfterFunc(meekSessionTimeout, func() {
+			if v, ok := cdnMeekSessions.LoadAndDelete(sessionID); ok {
+				v.(*cdnMeekSession).conn.Close()
+			}
+		})
 	}
-	sess := val.(*cdnSession)
 
-	data, err := io.ReadAll(r.Body)
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+
+	// Forward upstream body to target.
+	upData, err := io.ReadAll(r.Body)
 	r.Body.Close()
 	if err != nil {
 		return caddyhttp.Error(http.StatusBadRequest, err)
 	}
-
-	if len(data) > 0 {
-		select {
-		case <-sess.done:
-			return caddyhttp.Error(http.StatusGone, errors.New("session closed"))
-		default:
-			if _, err := sess.pw.Write(data); err != nil {
-				return caddyhttp.Error(http.StatusGone, errors.New("session pipe closed"))
-			}
+	if len(upData) > 0 {
+		if _, err := sess.conn.Write(upData); err != nil {
+			cdnMeekSessions.Delete(sessionID)
+			sess.conn.Close()
+			return caddyhttp.Error(http.StatusGone, errors.New("target write failed"))
 		}
 	}
 
-	w.WriteHeader(http.StatusOK)
+	// Read available downstream data with a short timeout.
+	if err := sess.conn.SetReadDeadline(time.Now().Add(meekReadTimeout)); err != nil {
+		return err
+	}
+	downBuf := make([]byte, 32*1024)
+	n, readErr := sess.conn.Read(downBuf)
+	sess.conn.SetReadDeadline(time.Time{}) //nolint:errcheck
+
+	targetClosed := readErr != nil && !errors.Is(readErr, os.ErrDeadlineExceeded)
+	if targetClosed {
+		cdnMeekSessions.Delete(sessionID)
+		sess.conn.Close()
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("X-Accel-Buffering", "no")
+	if targetClosed {
+		// Notify client that the target closed, even if we have data to return.
+		w.Header().Set("X-Naive-Closed", "1")
+	}
+	if n > 0 {
+		w.Header().Set("Content-Length", strconv.Itoa(n))
+		w.WriteHeader(http.StatusOK)
+		w.Write(downBuf[:n]) //nolint:errcheck
+	} else if targetClosed {
+		w.WriteHeader(http.StatusGone) // 410: tell client session is done
+	} else {
+		w.WriteHeader(http.StatusNoContent) // 204: no data this poll
+	}
 	return nil
 }
 
