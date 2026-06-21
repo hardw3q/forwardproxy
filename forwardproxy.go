@@ -576,7 +576,12 @@ func (h *Handler) serveCDNUp(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h Handler) checkCredentials(r *http.Request) error {
-	pa := strings.Split(r.Header.Get("Proxy-Authorization"), " ")
+	// Accept auth from X-Naive-Auth when Proxy-Authorization is absent (CDN strips hop-by-hop headers).
+	authHeader := r.Header.Get("Proxy-Authorization")
+	if authHeader == "" {
+		authHeader = r.Header.Get("X-Naive-Auth")
+	}
+	pa := strings.Split(authHeader, " ")
 	if len(pa) != 2 {
 		return errors.New("Proxy-Authorization is required! Expected format: <type> <credentials>")
 	}
