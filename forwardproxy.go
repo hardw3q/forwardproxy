@@ -458,38 +458,37 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return forwardResponse(w, response)
 }
 
-func (h *Handler) isCDNTunnelRequest(r *http.Request) bool {
-	return h.CDNTunnelPath != "" && r.Method == http.MethodPost && r.URL.Path == h.CDNTunnelPath
+// cdnSession is created by GET /tunnel and receives upstream data from POST /tunnel.
+type cdnSession struct {
+	pw   *io.PipeWriter
+	done chan struct{}
 }
 
-// serveCDNTunnel handles POST /tunnel requests from the naivecdn client.
-// The CDN forwards these POST requests to us, giving us bidirectional streaming
-// via the POST body (client→server) and response body (server→client).
-// The same NaiveProxy padding protocol is applied, reusing dualStream unchanged.
+// cdnSessions maps session ID → *cdnSession for the split-tunnel protocol.
+var cdnSessions sync.Map
+
+func (h *Handler) isCDNTunnelRequest(r *http.Request) bool {
+	return h.CDNTunnelPath != "" && r.URL.Path == h.CDNTunnelPath &&
+		(r.Method == http.MethodGet || r.Method == http.MethodPost)
+}
+
 func (h *Handler) serveCDNTunnel(w http.ResponseWriter, r *http.Request, ctx context.Context) error {
+	if r.Method == http.MethodGet {
+		return h.serveCDNDown(w, r, ctx)
+	}
+	return h.serveCDNUp(w, r)
+}
+
+// serveCDNDown handles GET /tunnel — the downstream half of the split tunnel.
+// It dials the target, registers the session so POST /tunnel can write upstream
+// data, then streams target→client in the response body. CDNs never buffer
+// response bodies, so this direction works regardless of CDN buffering behaviour.
+func (h *Handler) serveCDNDown(w http.ResponseWriter, r *http.Request, ctx context.Context) error {
+	sessionID := r.Header.Get("X-Naive-Session")
 	hostPort := r.Header.Get("X-Naive-Target")
-	if hostPort == "" {
-		return caddyhttp.Error(http.StatusBadRequest, errors.New("missing X-Naive-Target header"))
-	}
-
-	// Build padding response header (same range as CONNECT response: [30, 62))
-	paddingLen := rand.Intn(32) + 30
-	padding := make([]byte, paddingLen)
-	bits := rand.Uint64()
-	for i := 0; i < 16; i++ {
-		padding[i] = "!#$()+<>?@[]^`{}"[bits&15]
-		bits >>= 4
-	}
-	for i := 16; i < paddingLen; i++ {
-		padding[i] = '~'
-	}
-
-	w.Header().Set("Padding", string(padding))
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.WriteHeader(http.StatusOK)
-	if err := http.NewResponseController(w).Flush(); err != nil {
-		return caddyhttp.Error(http.StatusInternalServerError,
-			fmt.Errorf("flush error: %v", err))
+	if sessionID == "" || hostPort == "" {
+		return caddyhttp.Error(http.StatusBadRequest,
+			errors.New("missing X-Naive-Session or X-Naive-Target"))
 	}
 
 	targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
@@ -500,11 +499,80 @@ func (h *Handler) serveCDNTunnel(w http.ResponseWriter, r *http.Request, ctx con
 		return caddyhttp.Error(http.StatusForbidden,
 			fmt.Errorf("hostname %s is not allowed", hostPort))
 	}
-	defer targetConn.Close()
 
-	hasPadding := r.Header.Get("Padding") != ""
-	defer r.Body.Close()
-	return dualStream(targetConn, r.Body, w, hasPadding)
+	pr, pw := io.Pipe()
+	sess := &cdnSession{pw: pw, done: make(chan struct{})}
+	cdnSessions.Store(sessionID, sess)
+	defer func() {
+		cdnSessions.Delete(sessionID)
+		close(sess.done)
+		pw.Close()
+		targetConn.Close()
+	}()
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+	rc := http.NewResponseController(w)
+	if err := rc.Flush(); err != nil {
+		return err
+	}
+
+	// Forward upstream pipe → target (data arriving from POST /tunnel handlers).
+	go func() {
+		io.Copy(targetConn, pr) //nolint:errcheck
+	}()
+
+	// Stream target → client response body.
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := targetConn.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return nil
+			}
+			_ = rc.Flush()
+		}
+		if err != nil {
+			return nil
+		}
+	}
+}
+
+// serveCDNUp handles POST /tunnel — the upstream half of the split tunnel.
+// Each POST carries a small complete chunk of client→target data. The CDN
+// buffers small request bodies quickly, so latency per chunk is ~1 CDN RTT.
+func (h *Handler) serveCDNUp(w http.ResponseWriter, r *http.Request) error {
+	sessionID := r.Header.Get("X-Naive-Session")
+	if sessionID == "" {
+		return caddyhttp.Error(http.StatusBadRequest, errors.New("missing X-Naive-Session"))
+	}
+
+	val, ok := cdnSessions.Load(sessionID)
+	if !ok {
+		return caddyhttp.Error(http.StatusNotFound,
+			fmt.Errorf("session %s not found", sessionID))
+	}
+	sess := val.(*cdnSession)
+
+	data, err := io.ReadAll(r.Body)
+	r.Body.Close()
+	if err != nil {
+		return caddyhttp.Error(http.StatusBadRequest, err)
+	}
+
+	if len(data) > 0 {
+		select {
+		case <-sess.done:
+			return caddyhttp.Error(http.StatusGone, errors.New("session closed"))
+		default:
+			if _, err := sess.pw.Write(data); err != nil {
+				return caddyhttp.Error(http.StatusGone, errors.New("session pipe closed"))
+			}
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+	return nil
 }
 
 func (h Handler) checkCredentials(r *http.Request) error {
