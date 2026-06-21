@@ -480,24 +480,17 @@ func (h *Handler) serveCDNTunnel(w http.ResponseWriter, r *http.Request, ctx con
 }
 
 // serveCDNDown handles GET /tunnel — the downstream half of the split tunnel.
-// It dials the target, registers the session so POST /tunnel can write upstream
-// data, then streams target→client in the response body. CDNs never buffer
-// response bodies, so this direction works regardless of CDN buffering behaviour.
+// It returns 200 OK immediately (before dialing the target) so CDNs that buffer
+// before forwarding response headers don't add a full dial-latency to the
+// client's TLS handshake window. The target is dialed asynchronously; the pipe
+// between POST /tunnel handlers and the target absorbs data written before
+// the dial completes.
 func (h *Handler) serveCDNDown(w http.ResponseWriter, r *http.Request, ctx context.Context) error {
 	sessionID := r.Header.Get("X-Naive-Session")
 	hostPort := r.Header.Get("X-Naive-Target")
 	if sessionID == "" || hostPort == "" {
 		return caddyhttp.Error(http.StatusBadRequest,
 			errors.New("missing X-Naive-Session or X-Naive-Target"))
-	}
-
-	targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
-	if err != nil {
-		return err
-	}
-	if targetConn == nil {
-		return caddyhttp.Error(http.StatusForbidden,
-			fmt.Errorf("hostname %s is not allowed", hostPort))
 	}
 
 	pr, pw := io.Pipe()
@@ -507,12 +500,12 @@ func (h *Handler) serveCDNDown(w http.ResponseWriter, r *http.Request, ctx conte
 		cdnSessions.Delete(sessionID)
 		close(sess.done)
 		pw.Close()
-		targetConn.Close()
+		pr.Close()
 	}()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
-	w.Header().Set("X-Accel-Buffering", "no") // disable nginx/CDN response buffering
+	w.Header().Set("X-Accel-Buffering", "no") // hint to nginx-based CDNs to disable buffering
 	w.Header().Set("Surrogate-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	rc := http.NewResponseController(w)
@@ -520,10 +513,27 @@ func (h *Handler) serveCDNDown(w http.ResponseWriter, r *http.Request, ctx conte
 		return err
 	}
 
-	// Forward upstream pipe → target (data arriving from POST /tunnel handlers).
+	// Dial the target asynchronously and pipe data in both directions.
+	// POST /tunnel handlers write upstream chunks to pw; the goroutine below
+	// forwards them to the target once the dial succeeds.
+	targetCh := make(chan net.Conn, 1)
 	go func() {
+		targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
+		if err != nil || targetConn == nil {
+			pr.CloseWithError(fmt.Errorf("dial %s failed: %v", hostPort, err))
+			targetCh <- nil
+			return
+		}
+		targetCh <- targetConn
 		io.Copy(targetConn, pr) //nolint:errcheck
+		targetConn.Close()
 	}()
+
+	targetConn := <-targetCh
+	if targetConn == nil {
+		return nil
+	}
+	defer targetConn.Close()
 
 	// Stream target → client response body.
 	buf := make([]byte, 32*1024)
