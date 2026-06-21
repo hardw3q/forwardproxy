@@ -511,6 +511,9 @@ func (h *Handler) serveCDNDown(w http.ResponseWriter, r *http.Request, ctx conte
 	}()
 
 	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("X-Accel-Buffering", "no") // disable nginx/CDN response buffering
+	w.Header().Set("Surrogate-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	rc := http.NewResponseController(w)
 	if err := rc.Flush(); err != nil {
